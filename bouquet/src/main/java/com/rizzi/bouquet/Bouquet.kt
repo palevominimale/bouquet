@@ -2,6 +2,7 @@ package com.rizzi.bouquet
 
 import android.content.Context
 import android.os.ParcelFileDescriptor
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -9,26 +10,32 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.composed
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalViewConfiguration
+import androidx.compose.ui.platform.debugInspectorInfo
+import androidx.compose.ui.unit.Constraints
 import com.google.accompanist.pager.ExperimentalPagerApi
 import com.google.accompanist.pager.HorizontalPager
 import com.rizzi.bouquet.network.getDownloadInterface
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.io.BufferedInputStream
 import java.io.File
 import java.io.IOException
-import java.net.URL
+import kotlin.math.abs
 
 @Composable
 fun VerticalPDFReader(
@@ -60,35 +67,7 @@ fun VerticalPDFReader(
             LazyColumn(
                 modifier = Modifier
                     .fillMaxSize()
-                    .pointerInput(Unit) {
-                        detectTransformGestures(true) { centroid, pan, zoom, rotation ->
-                            if (!state.mIsZoomEnable) return@detectTransformGestures
-                            val nScale = (state.scale * zoom)
-                                .coerceAtLeast(1f)
-                                .coerceAtMost(3f)
-                            val nOffset = if (nScale > 1f) {
-                                val maxT =
-                                    (constraints.maxWidth * state.scale) - constraints.maxWidth
-                                Offset(
-                                    x = (state.offset.x + pan.x).coerceIn(
-                                        minimumValue = -maxT / 2,
-                                        maximumValue = maxT / 2
-                                    ),
-                                    y = 0f
-                                )
-                            } else {
-                                Offset(0f, 0f)
-                            }
-                            val scaleDiff = nScale - state.scale
-                            val oldScale = state.scale
-                            val scroll = lazyState.firstVisibleItemScrollOffset / oldScale
-                            state.mScale = nScale
-                            state.offset = nOffset
-                            coroutineScope.launch {
-                                lazyState.scrollBy((centroid.y + scroll / 2) * scaleDiff)
-                            }
-                        }
-                    },
+                    .tapToZoomVertical(state, constraints),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 state = lazyState
             ) {
@@ -157,32 +136,7 @@ fun HorizontalPDFReader(
             HorizontalPager(
                 modifier = Modifier
                     .fillMaxSize()
-                    .pointerInput(Unit) {
-                        detectTransformGestures(true) { centroid, pan, zoom, rotation ->
-                            if (!state.mIsZoomEnable) return@detectTransformGestures
-                            val nScale = (state.scale * zoom)
-                                .coerceAtLeast(1f)
-                                .coerceAtMost(3f)
-                            val nOffset = if (nScale > 1f) {
-                                val maxT = constraints.maxWidth * (state.scale - 1)
-                                val maxH = constraints.maxHeight * (state.scale - 1)
-                                Offset(
-                                    x = (state.offset.x + pan.x).coerceIn(
-                                        minimumValue = -maxT / 2,
-                                        maximumValue = maxT / 2
-                                    ),
-                                    y = (state.offset.y + pan.y).coerceIn(
-                                        minimumValue = -maxH / 2,
-                                        maximumValue = maxH / 2
-                                    )
-                                )
-                            } else {
-                                Offset(0f, 0f)
-                            }
-                            state.mScale = nScale
-                            state.offset = nOffset
-                        }
-                    },
+                    .pinchToZoomHorizontal(state, constraints),
                 count = state.pdfPageCount,
                 state = state.pagerState,
                 userScrollEnabled = state.scale == 1f
@@ -240,24 +194,29 @@ private fun load(
             coroutineScope.launch(Dispatchers.IO) {
                 val pFD =
                     ParcelFileDescriptor.open(state.mFile, ParcelFileDescriptor.MODE_READ_ONLY)
-                val textForEachPage = if (state.isAccessibleEnable) getTextByPage(context, pFD) else emptyList()
+                val textForEachPage =
+                    if (state.isAccessibleEnable) getTextByPage(context, pFD) else emptyList()
                 state.pdfRender = BouquetPdfRender(pFD, textForEachPage, width, height, portrait)
             }
         } else {
             when (val res = state.resource) {
                 is ResourceType.Local -> {
                     coroutineScope.launch(Dispatchers.IO) {
-                        context.contentResolver.openFileDescriptor(res.uri, "r")?.let {
-                            val textForEachPage = if (state.isAccessibleEnable) {
-                                getTextByPage(context, it)
-                            } else emptyList()
-                            state.pdfRender = BouquetPdfRender(it, textForEachPage, width, height, portrait)
-                            state.mFile = context.uriToFile(res.uri)
-                        } ?: run {
-                            state.mError = IOException("File not found")
+                        runCatching {
+                            context.contentResolver.openFileDescriptor(res.uri, "r")?.let {
+                                val textForEachPage = if (state.isAccessibleEnable) {
+                                    getTextByPage(context, it)
+                                } else emptyList()
+                                state.pdfRender =
+                                    BouquetPdfRender(it, textForEachPage, width, height, portrait)
+                                state.mFile = context.uriToFile(res.uri)
+                            } ?: throw IOException("File not found")
+                        }.onFailure {
+                            state.mError = it
                         }
                     }
                 }
+
                 is ResourceType.Remote -> {
                     coroutineScope.launch(Dispatchers.IO) {
                         runCatching {
@@ -294,13 +253,15 @@ private fun load(
                             val textForEachPage = if (state.isAccessibleEnable) {
                                 getTextByPage(context, pFD)
                             } else emptyList()
-                            state.pdfRender = BouquetPdfRender(pFD, textForEachPage, width, height, portrait)
+                            state.pdfRender =
+                                BouquetPdfRender(pFD, textForEachPage, width, height, portrait)
                             state.mFile = file
                         }.onFailure {
                             state.mError = it
                         }
                     }
                 }
+
                 is ResourceType.Base64 -> {
                     coroutineScope.launch(Dispatchers.IO) {
                         runCatching {
@@ -312,7 +273,8 @@ private fun load(
                             val textForEachPage = if (state.isAccessibleEnable) {
                                 getTextByPage(context, pFD)
                             } else emptyList()
-                            state.pdfRender = BouquetPdfRender(pFD, textForEachPage, width, height, portrait)
+                            state.pdfRender =
+                                BouquetPdfRender(pFD, textForEachPage, width, height, portrait)
                             state.mFile = file
                         }.onFailure {
                             state.mError = it
@@ -323,5 +285,146 @@ private fun load(
         }
     }.onFailure {
         state.mError = it
+    }
+}
+
+fun Modifier.pinchToZoomHorizontal(
+    state: HorizontalPdfReaderState,
+    constraints: Constraints
+): Modifier = composed(
+    inspectorInfo = debugInspectorInfo {
+        name = "pinchToZoom"
+        properties["state"] = state
+    }
+) {
+    pointerInput(Unit) {
+        detectTransformGestures(true) { centroid, pan, zoom, rotation ->
+            if (!state.mIsZoomEnable) return@detectTransformGestures
+            val nScale = (state.scale * zoom)
+                .coerceAtLeast(1f)
+                .coerceAtMost(3f)
+            val nOffset = if (nScale > 1f) {
+                val maxT = constraints.maxWidth * (state.scale - 1)
+                val maxH = constraints.maxHeight * (state.scale - 1)
+                Offset(
+                    x = (state.offset.x + pan.x).coerceIn(
+                        minimumValue = -maxT / 2,
+                        maximumValue = maxT / 2
+                    ),
+                    y = (state.offset.y + pan.y).coerceIn(
+                        minimumValue = -maxH / 2,
+                        maximumValue = maxH / 2
+                    )
+                )
+            } else {
+                Offset(0f, 0f)
+            }
+            state.mScale = nScale
+            state.offset = nOffset
+        }
+    }
+}
+
+fun Modifier.pinchToZoomVertical(
+    state: VerticalPdfReaderState,
+    constraints: Constraints
+): Modifier = composed(
+    inspectorInfo = debugInspectorInfo {
+        name = "pinchToZoom"
+        properties["state"] = state
+    }
+) {
+    val coroutineScope = rememberCoroutineScope()
+    pointerInput(Unit) {
+        detectTransformGestures(true) { centroid, pan, zoom, rotation ->
+            if (!state.mIsZoomEnable) return@detectTransformGestures
+            val nScale = (state.scale * zoom)
+                .coerceAtLeast(1f)
+                .coerceAtMost(3f)
+            val nOffset = if (nScale > 1f) {
+                val maxT =
+                    (constraints.maxWidth * state.scale) - constraints.maxWidth
+                Offset(
+                    x = (state.offset.x + pan.x).coerceIn(
+                        minimumValue = -maxT / 2,
+                        maximumValue = maxT / 2
+                    ),
+                    y = 0f
+                )
+            } else {
+                Offset(0f, 0f)
+            }
+            val scaleDiff = nScale - state.scale
+            val oldScale = state.scale
+            val scroll = state.lazyState.firstVisibleItemScrollOffset / oldScale
+            state.mScale = nScale
+            state.offset = nOffset
+            coroutineScope.launch {
+                state.lazyState.scrollBy((centroid.y + scroll / 2) * scaleDiff)
+            }
+        }
+    }
+}
+
+fun Modifier.tapToZoomVertical(
+    state: VerticalPdfReaderState,
+    constraints: Constraints
+): Modifier = composed(
+    inspectorInfo = debugInspectorInfo {
+        name = "pinchToZoom"
+        properties["state"] = state
+    }
+) {
+    val coroutineScope = rememberCoroutineScope()
+    pointerInput(Unit) {
+        detectTapGestures(
+            onDoubleTap = { tapCenter ->
+                if (state.mScale == 3.0f) {
+                    state.mScale = 1.0f
+                    state.offset = Offset(0f, 0f)
+                    coroutineScope.launch {
+                        state.lazyState.scrollBy(-constraints.maxHeight.toFloat()/2)
+                    }
+                } else {
+                    state.mScale = 3.0f
+                    val maxT =
+                        (constraints.maxWidth * state.scale) - constraints.maxWidth
+                    val xOffset = ((constraints.maxWidth/2 - tapCenter.x) * state.mScale).coerceIn(
+                        minimumValue = -maxT / 2,
+                        maximumValue = maxT / 2
+                    )
+                    val yOffset = if (constraints.maxHeight/2 >= tapCenter.y) {
+
+                        (tapCenter.y - constraints.maxHeight/2) * state.scale
+                    } else {
+                        (constraints.maxHeight/2 - tapCenter.y) * state.scale
+                    }
+                    println("cMaxW: ${constraints.maxWidth/2} - tapCenterX: ${tapCenter.x} = $xOffset")
+                    println("cMaxH: ${constraints.maxHeight/2} - tapCenterY: ${tapCenter.y} = $yOffset")
+                    state.offset = Offset(xOffset,0f)
+                    coroutineScope.launch {
+                        state.lazyState.scrollBy(constraints.maxHeight.toFloat()/2)
+                    }
+                }
+                println("$tapCenter" + "$constraints")
+            }
+        )
+    }.pointerInput(Unit) {
+        detectTransformGestures(true) { centroid, pan, zoom, rotation ->
+            val nOffset = if (state.scale > 1f) {
+                val maxT =
+                    (constraints.maxWidth * state.scale) - constraints.maxWidth
+                Offset(
+                    x = (state.offset.x + pan.x).coerceIn(
+                        minimumValue = -maxT / 2,
+                        maximumValue = maxT / 2
+                    ),
+                    y = 0f
+                )
+            } else {
+                Offset(0f, 0f)
+            }
+            state.offset = nOffset
+        }
     }
 }
